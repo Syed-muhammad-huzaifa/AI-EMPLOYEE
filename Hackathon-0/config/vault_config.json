@@ -1,0 +1,24 @@
+{
+  "vault_path": "/mnt/c/MY_EMPLOYEE",
+  "folders": {
+    "inbox": "Inbox",
+    "needs_action": "Needs_Action",
+    "plans": "Plans",
+    "done": "Done",
+    "logs": "Logs",
+    "in_progress": "In_Progress",
+    "pending_approval": "Pending_Approval",
+    "approved": "Approved",
+    "rejected": "Rejected",
+    "accounting": "Accounting",
+    "briefings": "Briefings"
+  },
+  "files": {
+    "dashboard": "Dashboard.md",
+    "company_handbook": "Company_Handbook.md",
+    "business_goals": "Business_Goals.md"
+  },
+  "polling_interval": 60,
+  "max_retries": 5,
+  "retry_delay": 5
+}

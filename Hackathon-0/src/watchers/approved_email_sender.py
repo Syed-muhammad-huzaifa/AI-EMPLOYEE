@@ -1,0 +1,709 @@
+"""
+Approved Email Sender
+=====================
+Watches the Approved/ vault folder. When a draft email file lands there it:
+  1. Parses the recipient, subject, and body from the Markdown
+  2. Sends the email via Gmail API (same credentials as email-mcp)
+  3. Moves the file to Done/ on success, Rejected/ on failure
+  4. Logs every action to Logs/
+
+Supported draft format (YAML front-matter + body):
+
+    ---
+    to: alice@example.com
+    subject: Re: Your inquiry
+    ---
+
+    Dear Alice,
+
+    Body text here...
+
+    Best regards,
+    Ralph
+
+If no front-matter is found the parser falls back to inline "Field: value" lines
+at the top of the file.
+"""
+
+import os
+import re
+import sys
+import time
+import pickle
+import base64
+import logging
+from pathlib import Path
+from typing import Optional, Dict, Tuple
+from datetime import datetime
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+from dotenv import load_dotenv
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+_BASE_DIR = Path(__file__).parent.parent.parent  # Hackathon-0/
+if str(_BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(_BASE_DIR))
+
+from src.vault.manager import VaultManager
+
+load_dotenv(_BASE_DIR / ".env")
+
+logger = logging.getLogger(__name__)
+
+TOKEN_PATH = _BASE_DIR / "config" / "gmail_token.pickle"
+_RETRYABLE  = (429, 500, 502, 503, 504)
+
+
+# ── Gmail service ─────────────────────────────────────────────────────────────
+
+def _load_service():
+    if not TOKEN_PATH.exists():
+        raise RuntimeError(
+            f"Token not found at {TOKEN_PATH}. "
+            "Run 'python scripts/authenticate_gmail.py' first."
+        )
+    with open(TOKEN_PATH, "rb") as fh:
+        creds = pickle.load(fh)
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            with open(TOKEN_PATH, "wb") as fh:
+                pickle.dump(creds, fh)
+        else:
+            raise RuntimeError("Credentials invalid — re-authenticate.")
+    return build("gmail", "v1", credentials=creds)
+
+
+# ── Draft parser ──────────────────────────────────────────────────────────────
+
+_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)", re.DOTALL)
+
+
+def parse_draft(content: str) -> Optional[Dict[str, str]]:
+    """
+    Parse a draft markdown file into {to, subject, body, task_id, action,
+    thread_id, in_reply_to}.
+    Returns None if required fields (to, subject) are missing.
+
+    Handles three layouts:
+      1. YAML frontmatter with to:/subject:/task_id: keys  (skill HITL format)
+      2. YAML frontmatter (other keys) + **To**:/**Subject**: in the body
+      3. Plain inline "To: ..." / "**To**: ..." lines (no frontmatter)
+    """
+    to = subject = body = task_id = action = thread_id = in_reply_to = None
+
+    # Strip frontmatter block (we'll scan both it and the remainder)
+    fm_match = _FRONTMATTER_RE.match(content.strip())
+    platform = None
+    if fm_match:
+        fm_block    = fm_match.group(1)
+        after_front = fm_match.group(2).strip()
+        # Scan frontmatter for all known keys
+        for line in fm_block.splitlines():
+            m = re.match(
+                r"^\s*(to|whatsapp_to|subject|task_id|action|thread_id|in_reply_to|platform)\s*:\s*(.+)",
+                line, re.IGNORECASE
+            )
+            if m:
+                key = m.group(1).lower()
+                val = m.group(2).strip()
+                if key in ("to", "whatsapp_to") and not to:
+                    to = val
+                elif key == "subject" and not subject:
+                    subject = val
+                elif key == "task_id" and not task_id:
+                    task_id = val
+                elif key == "action" and not action:
+                    action = val
+                elif key == "thread_id" and not thread_id:
+                    thread_id = val
+                elif key == "in_reply_to" and not in_reply_to:
+                    in_reply_to = val
+                elif key == "platform" and not platform:
+                    platform = val
+        # Scan the body section for **To**: / **Subject**: patterns
+        body_lines = after_front.splitlines()
+    else:
+        body_lines = content.splitlines()
+
+    # Scan lines for bold or plain "To:" / "Subject:" / "Task_id:" patterns
+    body_start = 0
+    for i, line in enumerate(body_lines[:40]):
+        m = re.match(r"^\s*\*{0,2}(to|subject|task_id|action)\*{0,2}\s*:\s*(.+)", line, re.IGNORECASE)
+        if m:
+            key = m.group(1).lower()
+            val = m.group(2).strip()
+            if key == "to" and not to:
+                to = val
+            elif key == "subject" and not subject:
+                subject = val
+            elif key == "task_id" and not task_id:
+                task_id = val
+            elif key == "action" and not action:
+                action = val
+            body_start = i + 1
+        if to and subject and i > body_start:
+            break
+
+    if body is None:
+        # Take everything after the header lines as the body
+        # Skip markdown section headers like "## Email Body", "## To Approve"
+        raw_body_lines = body_lines[body_start:]
+        body_content = []
+        for line in raw_body_lines:
+            if re.match(r"^##\s+(To Approve|To Reject)", line):
+                break  # stop at approval instructions
+            body_content.append(line)
+        body = "\n".join(body_content).strip()
+        # Remove leading "## Email Body" header if present
+        body = re.sub(r"^##\s+Email Body\s*\n", "", body).strip()
+
+    _action = (action or "send_email").strip()
+    # Social media posts don't need 'to' or 'subject'
+    if _action in ("post_linkedin", "post_twitter", "post_facebook", "post_social_media", "post_social"):
+        return {
+            "to":          to or "",
+            "subject":     subject or "",
+            "body":        body or "",
+            "task_id":     task_id.strip() if task_id else None,
+            "action":      _action,
+            "platform":    platform.strip() if platform else "linkedin",
+            "thread_id":   thread_id.strip() if thread_id else None,
+            "in_reply_to": in_reply_to.strip() if in_reply_to else None,
+        }
+
+    # Email and WhatsApp require 'to' field
+    if not to:
+        return None
+    if _action == "send_email" and not subject:
+        return None
+
+    return {
+        "to":          to.strip(),
+        "subject":     subject.strip() if subject else "",
+        "body":        body or "",
+        "task_id":     task_id.strip() if task_id else None,
+        "action":      _action,
+        "thread_id":   thread_id.strip() if thread_id else None,
+        "in_reply_to": in_reply_to.strip() if in_reply_to else None,
+    }
+
+
+# ── Sender ────────────────────────────────────────────────────────────────────
+
+def _send_with_retry(service, to: str, subject: str, body: str,
+                     thread_id: Optional[str] = None,
+                     in_reply_to: Optional[str] = None,
+                     max_retries: int = 3) -> Tuple[bool, str]:
+    """
+    Send email, retry on transient errors.
+    Pass thread_id + in_reply_to to reply in the same Gmail thread.
+    Returns (success: bool, message_id_or_error: str).
+    """
+    backoff = 1
+    for attempt in range(1, max_retries + 1):
+        try:
+            mime = MIMEMultipart()
+            mime["to"]      = to
+            mime["subject"] = subject
+            if in_reply_to:
+                mime["In-Reply-To"] = in_reply_to
+                mime["References"]  = in_reply_to
+            mime.attach(MIMEText(body, "plain"))
+            raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
+            send_body: Dict = {"raw": raw}
+            if thread_id:
+                send_body["threadId"] = thread_id
+            result = service.users().messages().send(
+                userId="me", body=send_body
+            ).execute()
+            return True, result.get("id", "unknown")
+        except HttpError as exc:
+            if exc.resp.status in _RETRYABLE and attempt < max_retries:
+                logger.warning(f"Retryable error (attempt {attempt}): {exc}. Retry in {backoff}s")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                continue
+            return False, f"GMAIL_API_ERROR: {exc}"
+        except Exception as exc:
+            if attempt < max_retries:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                continue
+            return False, f"NETWORK_ERROR: {exc}"
+    return False, "MAX_RETRIES_EXCEEDED"
+
+
+# ── ApprovedEmailSender ───────────────────────────────────────────────────────
+
+class ApprovedEmailSender:
+    """
+    Daemon that polls Approved/ and sends any email draft files it finds.
+    Not a BaseWatcher subclass because it doesn't create action files —
+    it consumes and moves them.
+    """
+
+    def __init__(self, vault_path: Optional[str] = None, check_interval: int = 15,
+                 dry_run: bool = False):
+        load_dotenv(_BASE_DIR / ".env")
+
+        vault_path = vault_path or os.getenv("VAULT_PATH", "/mnt/c/MY_EMPLOYEE") or "/mnt/c/MY_EMPLOYEE"
+        self.vault          = Path(vault_path)
+        self.approved_dir   = self.vault / "Approved"
+        self.done_dir       = self.vault / "Done"
+        self.rejected_dir   = self.vault / "Rejected"
+        self.check_interval = check_interval
+        self.dry_run        = dry_run or os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
+        self.vault_manager  = VaultManager(vault_path)
+        self._shutdown      = False
+        self.logger         = logging.getLogger(self.__class__.__name__)
+
+        for d in (self.approved_dir, self.done_dir, self.rejected_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+        self.logger.info(
+            f"ApprovedEmailSender ready | vault={vault_path} | "
+            f"interval={check_interval}s | dry_run={self.dry_run}"
+        )
+
+    def stop(self):
+        self._shutdown = True
+
+    def run(self):
+        """Polling loop — runs forever until stop() is called."""
+        self.logger.info("ApprovedEmailSender started.")
+        while not self._shutdown:
+            try:
+                self._process_approved_files()
+            except Exception as exc:
+                self.logger.error(f"Error in ApprovedEmailSender loop: {exc}")
+            time.sleep(self.check_interval)
+
+    def _process_approved_files(self):
+        if not self.approved_dir.exists():
+            return
+
+        for file_path in sorted(self.approved_dir.iterdir()):
+            if not file_path.is_file() or file_path.suffix != ".md":
+                continue
+            self._handle_approved_file(file_path)
+
+    def _handle_approved_file(self, file_path: Path):
+        self.logger.info(f"Processing approved file: {file_path.name}")
+
+        try:
+            content = file_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            self.logger.error(f"Could not read {file_path}: {exc}")
+            return
+
+        draft = parse_draft(content)
+        if not draft:
+            self.logger.warning(
+                f"Could not parse fields from {file_path.name} — "
+                "expected at minimum 'to:' (and 'subject:' for email). Moving to Rejected/."
+            )
+            self._move(file_path, self.rejected_dir, reason="parse_failed")
+            return
+
+        action      = draft.get("action", "send_email")
+        to          = draft["to"]
+        subject     = draft.get("subject", "")
+        body        = draft["body"]
+        task_id     = draft.get("task_id")
+        thread_id   = draft.get("thread_id")
+        in_reply_to = draft.get("in_reply_to")
+
+        # ── Route to correct channel ──────────────────────────────────────────
+        if action == "send_whatsapp":
+            self._handle_whatsapp_send(file_path, to, body, task_id)
+            return
+        elif action == "post_linkedin":
+            self._handle_linkedin_post(file_path, body, task_id)
+            return
+        elif action == "post_twitter":
+            self._handle_twitter_post(file_path, body, task_id)
+            return
+        elif action == "post_facebook":
+            self._handle_facebook_post(file_path, body, task_id)
+            return
+        elif action == "post_social":
+            # Route based on platform field in frontmatter
+            platform = draft.get("platform", "linkedin").lower()
+            if platform == "linkedin":
+                self._handle_linkedin_post(file_path, body, task_id)
+            elif platform == "twitter":
+                self._handle_twitter_post(file_path, body, task_id)
+            elif platform == "facebook":
+                self._handle_facebook_post(file_path, body, task_id)
+            else:
+                self._handle_linkedin_post(file_path, body, task_id)
+            return
+        elif action == "post_social_media":
+            # Multi-platform post - extract each platform's content
+            self._handle_multi_platform_post(file_path, draft, task_id)
+            return
+
+        self.logger.info(f"Sending email → to=** {to} | subject=** {subject[:60]}")
+
+        # ── Dry run ──────────────────────────────────────────────────────────
+        if self.dry_run:
+            self.logger.info(
+                f"[DRY RUN] Would send email | to={to} | subject={subject[:60]}"
+            )
+            self.vault_manager.log_activity(
+                "Email approved and sent (DRY RUN)",
+                {"to": to, "subject": subject[:60], "file": file_path.name},
+            )
+            self._move(file_path, self.done_dir, reason="sent_dry_run")
+            self._close_original_task(task_id, reason="sent_dry_run")
+            return
+
+        # ── Real send ─────────────────────────────────────────────────────────
+        try:
+            service          = _load_service()
+            success, msg_ref = _send_with_retry(
+                service, to, subject, body,
+                thread_id=thread_id, in_reply_to=in_reply_to
+            )
+        except RuntimeError as exc:
+            self.logger.error(f"Authentication failed: {exc}")
+            self._move(file_path, self.rejected_dir, reason="auth_failed")
+            return
+
+        if success:
+            self.logger.info(f"✅ Email sent | message_id={msg_ref} | to={to}")
+            self.vault_manager.log_activity(
+                "Email sent successfully",
+                {"to": to, "subject": subject[:60],
+                 "message_id": msg_ref, "file": file_path.name},
+            )
+            self._move(file_path, self.done_dir, reason="sent")
+            self._close_original_task(task_id, reason="email_sent")
+        else:
+            self.logger.error(f"❌ Email send failed: {msg_ref}")
+            self.vault_manager.log_activity(
+                "Email send FAILED",
+                {"to": to, "subject": subject[:60],
+                 "error": msg_ref, "file": file_path.name},
+            )
+            self._move(file_path, self.rejected_dir, reason=msg_ref)
+
+    def _handle_whatsapp_send(
+        self, file_path: Path, to: str, body: str, task_id: Optional[str]
+    ):
+        """Send an approved WhatsApp reply via Twilio."""
+        from src.watchers.whatsapp_watcher import send_whatsapp_message, ConversationStore
+
+        self.logger.info(f"Sending WhatsApp → to={to}")
+
+        if self.dry_run:
+            self.logger.info(f"[DRY RUN] Would send WhatsApp | to={to}")
+            self.vault_manager.log_activity(
+                "WhatsApp approved and sent (DRY RUN)",
+                {"to": to, "file": file_path.name},
+            )
+            self._move(file_path, self.done_dir, reason="sent_dry_run")
+            self._close_original_task(task_id, reason="sent_dry_run")
+            return
+
+        success, ref = send_whatsapp_message(to, body)
+        if success:
+            self.logger.info(f"✅ WhatsApp sent | sid={ref} | to={to}")
+            # Log the assistant reply in conversation history
+            try:
+                store = ConversationStore()
+                store.add_message(to, "assistant", body)
+            except Exception:
+                pass
+            self.vault_manager.log_activity(
+                "WhatsApp sent successfully",
+                {"to": to, "sid": ref, "file": file_path.name},
+            )
+            self._move(file_path, self.done_dir, reason="sent")
+            self._close_original_task(task_id, reason="whatsapp_sent")
+        else:
+            self.logger.error(f"❌ WhatsApp send failed: {ref}")
+            self.vault_manager.log_activity(
+                "WhatsApp send FAILED",
+                {"to": to, "error": ref, "file": file_path.name},
+            )
+            self._move(file_path, self.rejected_dir, reason=ref)
+
+    def _handle_linkedin_post(self, file_path: Path, body: str, task_id: Optional[str]):
+        """Post to LinkedIn after human approval."""
+        self.logger.info("Posting to LinkedIn")
+
+        if self.dry_run:
+            self.logger.info(f"[DRY RUN] Would post to LinkedIn | length={len(body)}")
+            self.vault_manager.log_activity(
+                "LinkedIn post approved (DRY RUN)",
+                {"file": file_path.name},
+            )
+            self._move(file_path, self.done_dir, reason="posted_dry_run")
+            self._close_original_task(task_id, reason="posted_dry_run")
+            return
+
+        try:
+            import subprocess
+            post_script = Path(__file__).parent.parent.parent / "scripts" / "post_social.py"
+            result = subprocess.run(
+                ["python3", str(post_script), "linkedin", body],
+                capture_output=True, text=True, timeout=60
+            )
+
+            if result.returncode == 0:
+                self.logger.info("✅ LinkedIn post published")
+                self.vault_manager.log_activity(
+                    "LinkedIn post published",
+                    {"file": file_path.name},
+                )
+                self._move(file_path, self.done_dir, reason="posted")
+                self._close_original_task(task_id, reason="linkedin_posted")
+            else:
+                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                self.logger.error(f"❌ LinkedIn post failed: {error_msg}")
+                self._move(file_path, self.rejected_dir, reason="linkedin_post_failed")
+        except Exception as exc:
+            self.logger.error(f"LinkedIn post error: {exc}")
+            self._move(file_path, self.rejected_dir, reason=str(exc))
+
+    def _handle_twitter_post(self, file_path: Path, body: str, task_id: Optional[str]):
+        """Post to Twitter after human approval."""
+        self.logger.info("Posting to Twitter")
+
+        if self.dry_run:
+            self.logger.info(f"[DRY RUN] Would post to Twitter | length={len(body)}")
+            self.vault_manager.log_activity(
+                "Twitter post approved (DRY RUN)",
+                {"file": file_path.name},
+            )
+            self._move(file_path, self.done_dir, reason="posted_dry_run")
+            self._close_original_task(task_id, reason="posted_dry_run")
+            return
+
+        try:
+            import subprocess
+            post_script = Path(__file__).parent.parent.parent / "scripts" / "post_social.py"
+            result = subprocess.run(
+                ["python3", str(post_script), "twitter", body],
+                capture_output=True, text=True, timeout=60
+            )
+
+            if result.returncode == 0:
+                self.logger.info("✅ Twitter post published")
+                self.vault_manager.log_activity(
+                    "Twitter post published",
+                    {"file": file_path.name},
+                )
+                self._move(file_path, self.done_dir, reason="posted")
+                self._close_original_task(task_id, reason="twitter_posted")
+            else:
+                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                self.logger.error(f"❌ Twitter post failed: {error_msg}")
+                self._move(file_path, self.rejected_dir, reason="twitter_post_failed")
+        except Exception as exc:
+            self.logger.error(f"Twitter post error: {exc}")
+            self._move(file_path, self.rejected_dir, reason=str(exc))
+
+    def _handle_facebook_post(self, file_path: Path, body: str, task_id: Optional[str]):
+        """Post to Facebook after human approval."""
+        self.logger.info("Posting to Facebook")
+
+        if self.dry_run:
+            self.logger.info(f"[DRY RUN] Would post to Facebook | length={len(body)}")
+            self.vault_manager.log_activity(
+                "Facebook post approved (DRY RUN)",
+                {"file": file_path.name},
+            )
+            self._move(file_path, self.done_dir, reason="posted_dry_run")
+            self._close_original_task(task_id, reason="posted_dry_run")
+            return
+
+        try:
+            import subprocess
+            post_script = Path(__file__).parent.parent.parent / "scripts" / "post_social.py"
+            result = subprocess.run(
+                ["python3", str(post_script), "facebook", body],
+                capture_output=True, text=True, timeout=60
+            )
+
+            if result.returncode == 0:
+                self.logger.info("✅ Facebook post published")
+                self.vault_manager.log_activity(
+                    "Facebook post published",
+                    {"file": file_path.name},
+                )
+                self._move(file_path, self.done_dir, reason="posted")
+                self._close_original_task(task_id, reason="facebook_posted")
+            else:
+                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                self.logger.error(f"❌ Facebook post failed: {error_msg}")
+                self._move(file_path, self.rejected_dir, reason="facebook_post_failed")
+        except Exception as exc:
+            self.logger.error(f"Facebook post error: {exc}")
+            self._move(file_path, self.rejected_dir, reason=str(exc))
+            success = FacebookWatcher(str(self.vault)).post_to_facebook(body)
+            if success:
+                self.logger.info("✅ Facebook post published")
+                self.vault_manager.log_activity(
+                    "Facebook post published",
+                    {"file": file_path.name},
+                )
+                self._move(file_path, self.done_dir, reason="posted")
+                self._close_original_task(task_id, reason="facebook_posted")
+            else:
+                self.logger.error("❌ Facebook post failed")
+                self._move(file_path, self.rejected_dir, reason="facebook_post_failed")
+        except Exception as exc:
+            self.logger.error(f"Facebook post error: {exc}")
+            self._move(file_path, self.rejected_dir, reason=str(exc))
+
+    def _handle_multi_platform_post(self, file_path: Path, draft: Dict, task_id: Optional[str]):
+        """Handle multi-platform social media posts (LinkedIn, Twitter, Facebook)."""
+        import subprocess
+
+        content = file_path.read_text(encoding="utf-8")
+
+        # Extract platform-specific content
+        linkedin_match = re.search(r"## LinkedIn Post.*?\n\n(.*?)(?=\n---|\n##|$)", content, re.DOTALL)
+        twitter_match = re.search(r"## Twitter Post.*?\n\n(.*?)(?=\n---|\n##|$)", content, re.DOTALL)
+        facebook_match = re.search(r"## Facebook Post.*?\n\n(.*?)(?=\n---|\n##|$)", content, re.DOTALL)
+
+        results = []
+        post_script = Path(__file__).parent.parent.parent / "scripts" / "post_social.py"
+
+        # Post to LinkedIn
+        if linkedin_match:
+            linkedin_text = linkedin_match.group(1).strip()
+            self.logger.info("Posting to LinkedIn...")
+            try:
+                result = subprocess.run(
+                    ["python3", str(post_script), "linkedin", linkedin_text],
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                success = result.returncode == 0
+                results.append(("LinkedIn", success))
+                if success:
+                    self.logger.info("✅ LinkedIn post published")
+                else:
+                    self.logger.error(f"❌ LinkedIn post failed: {result.stderr}")
+            except Exception as exc:
+                self.logger.error(f"LinkedIn error: {exc}")
+                results.append(("LinkedIn", False))
+
+        # Post to Twitter
+        if twitter_match:
+            twitter_text = twitter_match.group(1).strip()
+            self.logger.info("Posting to Twitter...")
+            try:
+                result = subprocess.run(
+                    ["python3", str(post_script), "twitter", twitter_text],
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                success = result.returncode == 0
+                results.append(("Twitter", success))
+                if success:
+                    self.logger.info("✅ Twitter post published")
+                else:
+                    self.logger.error(f"❌ Twitter post failed: {result.stderr}")
+            except Exception as exc:
+                self.logger.error(f"Twitter error: {exc}")
+                results.append(("Twitter", False))
+
+        # Post to Facebook
+        if facebook_match:
+            facebook_text = facebook_match.group(1).strip()
+            self.logger.info("Posting to Facebook...")
+            try:
+                result = subprocess.run(
+                    ["python3", str(post_script), "facebook", facebook_text],
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                success = result.returncode == 0
+                results.append(("Facebook", success))
+                if success:
+                    self.logger.info("✅ Facebook post published")
+                else:
+                    self.logger.error(f"❌ Facebook post failed: {result.stderr}")
+            except Exception as exc:
+                self.logger.error(f"Facebook error: {exc}")
+                results.append(("Facebook", False))
+
+        # Determine overall success
+        all_success = all(success for _, success in results)
+        any_success = any(success for _, success in results)
+
+        summary = ", ".join(f"{platform}: {'✅' if success else '❌'}" for platform, success in results)
+
+        if all_success:
+            self.logger.info(f"✅ All platforms posted successfully | {summary}")
+            self.vault_manager.log_activity(
+                "Multi-platform post published",
+                {"platforms": summary, "file": file_path.name},
+            )
+            self._move(file_path, self.done_dir, reason="posted_all")
+            self._close_original_task(task_id, reason="social_media_posted")
+        elif any_success:
+            self.logger.warning(f"⚠️ Partial success | {summary}")
+            self.vault_manager.log_activity(
+                "Multi-platform post partially published",
+                {"platforms": summary, "file": file_path.name},
+            )
+            self._move(file_path, self.done_dir, reason="posted_partial")
+            self._close_original_task(task_id, reason="social_media_posted_partial")
+        else:
+            self.logger.error(f"❌ All platforms failed | {summary}")
+            self._move(file_path, self.rejected_dir, reason="all_platforms_failed")
+
+    def _close_original_task(self, task_id: Optional[str], reason: str = ""):
+        """Move the original task file from In_Progress to Done after email is sent."""
+        if not task_id:
+            return
+
+        in_progress_dir = self.vault / "In_Progress" / "orchestrator"
+        done_dir        = self.vault / "Done"
+
+        # Look for the original task file (with or without .md)
+        for candidate in [
+            in_progress_dir / f"{task_id}.md",
+            in_progress_dir / task_id,
+        ]:
+            if candidate.exists():
+                dest = done_dir / candidate.name
+                try:
+                    candidate.rename(dest)
+                    self.logger.info(
+                        f"✅ Original task archived | {candidate.name} → Done/ [{reason}]"
+                    )
+                    self.vault_manager.log_activity(
+                        "Original task moved to Done after approval",
+                        {"task_id": task_id, "reason": reason},
+                    )
+                except Exception as exc:
+                    self.logger.error(f"Could not move original task {candidate}: {exc}")
+                return
+
+        self.logger.debug(f"Original task file not found in In_Progress for task_id={task_id}")
+
+    def _move(self, src: Path, dest_dir: Path, reason: str = ""):
+        """Move a file to dest_dir, appending _reason to the name."""
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        stem    = src.stem
+        suffix  = src.suffix
+        ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest    = dest_dir / f"{stem}_{ts}{suffix}"
+        try:
+            src.rename(dest)
+            self.logger.info(f"Moved {src.name} → {dest_dir.name}/{dest.name} [{reason}]")
+        except Exception as exc:
+            self.logger.error(f"Could not move {src}: {exc}")

@@ -1,0 +1,317 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Gmail MCP Server Contract",
+  "description": "MCP server contract for Gmail email sending functionality",
+  "version": "1.0.0",
+  "server": {
+    "name": "gmail-mcp",
+    "version": "1.0.0",
+    "description": "MCP server for sending emails via Gmail API with approval workflow",
+    "protocol": "stdio",
+    "capabilities": {
+      "tools": true,
+      "resources": false,
+      "prompts": false
+    }
+  },
+  "tools": [
+    {
+      "name": "send_email",
+      "description": "Send an email via Gmail API. Requires prior approval workflow (draft must be in /Approved/ folder). Respects DRY_RUN environment variable for testing. Rate limited to 20 emails per hour and 100 API calls per day.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "to": {
+            "type": "string",
+            "description": "Recipient email address (RFC 5322 format)",
+            "pattern": "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$",
+            "minLength": 5,
+            "maxLength": 254,
+            "examples": [
+              "client@example.com",
+              "john.doe@company.co.uk"
+            ]
+          },
+          "subject": {
+            "type": "string",
+            "description": "Email subject line",
+            "minLength": 1,
+            "maxLength": 500,
+            "examples": [
+              "Re: Project update needed",
+              "Meeting follow-up"
+            ]
+          },
+          "body": {
+            "type": "string",
+            "description": "Email body content (plain text or HTML). Maximum 50KB.",
+            "minLength": 1,
+            "maxLength": 51200,
+            "examples": [
+              "Hi John,\n\nThank you for reaching out...",
+              "<html><body><p>Hi John,</p><p>Thank you for reaching out...</p></body></html>"
+            ]
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "If true, simulate send without actual delivery. Logs the action but does not call Gmail API. Useful for testing. Can be overridden by DRY_RUN environment variable.",
+            "default": false,
+            "examples": [true, false]
+          }
+        },
+        "required": ["to", "subject", "body"],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "description": "Whether the email was sent successfully"
+          },
+          "message_id": {
+            "type": "string",
+            "description": "Gmail message ID if sent successfully, null otherwise",
+            "pattern": "^[a-zA-Z0-9]+$"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "description": "ISO 8601 timestamp of when the email was sent"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "Whether this was a dry run (simulated send)"
+          },
+          "error": {
+            "type": "string",
+            "description": "Error message if success=false, null otherwise"
+          }
+        },
+        "required": ["success", "timestamp", "dry_run"],
+        "additionalProperties": false
+      },
+      "errors": [
+        {
+          "code": "INVALID_EMAIL",
+          "message": "Recipient email address is invalid (does not match RFC 5322 format)",
+          "httpStatus": 400
+        },
+        {
+          "code": "RATE_LIMIT_EXCEEDED",
+          "message": "Rate limit exceeded. Maximum 20 emails per hour or 100 API calls per day.",
+          "httpStatus": 429,
+          "retryAfter": "Time in seconds until next token available"
+        },
+        {
+          "code": "AUTHENTICATION_FAILED",
+          "message": "Gmail API authentication failed. OAuth2 token may be expired or invalid.",
+          "httpStatus": 401
+        },
+        {
+          "code": "GMAIL_API_ERROR",
+          "message": "Gmail API returned an error. See error details for specifics.",
+          "httpStatus": 502
+        },
+        {
+          "code": "NETWORK_ERROR",
+          "message": "Network connection failed. Will retry with exponential backoff.",
+          "httpStatus": 503
+        },
+        {
+          "code": "VALIDATION_ERROR",
+          "message": "Input validation failed. Check parameter constraints.",
+          "httpStatus": 400
+        }
+      ]
+    }
+  ],
+  "configuration": {
+    "environment": {
+      "GMAIL_CLIENT_ID": {
+        "type": "string",
+        "required": true,
+        "description": "OAuth2 client ID from Google Cloud Console",
+        "source": ".env"
+      },
+      "GMAIL_CLIENT_SECRET": {
+        "type": "string",
+        "required": true,
+        "description": "OAuth2 client secret from Google Cloud Console",
+        "source": ".env",
+        "sensitive": true
+      },
+      "DRY_RUN": {
+        "type": "boolean",
+        "required": false,
+        "default": false,
+        "description": "Global dry run mode. If true, all send_email calls are simulated.",
+        "source": ".env"
+      },
+      "LOG_LEVEL": {
+        "type": "string",
+        "required": false,
+        "default": "INFO",
+        "enum": ["DEBUG", "INFO", "WARNING", "ERROR"],
+        "description": "Logging verbosity level",
+        "source": ".env"
+      }
+    },
+    "files": {
+      "credentials": {
+        "path": "credentials/gmail_token.json",
+        "description": "OAuth2 access and refresh tokens",
+        "gitignored": true,
+        "format": "json"
+      }
+    }
+  },
+  "rateLimits": {
+    "send_email": {
+      "perHour": 20,
+      "perDay": 100,
+      "algorithm": "token_bucket",
+      "burstAllowed": true
+    }
+  },
+  "examples": [
+    {
+      "name": "Send simple email",
+      "request": {
+        "tool": "send_email",
+        "parameters": {
+          "to": "client@example.com",
+          "subject": "Project update",
+          "body": "Hi,\n\nHere's the latest update on the project...",
+          "dry_run": false
+        }
+      },
+      "response": {
+        "success": true,
+        "message_id": "18d4f2a3b5c6d7e8",
+        "timestamp": "2026-02-12T11:05:00Z",
+        "dry_run": false,
+        "error": null
+      }
+    },
+    {
+      "name": "Dry run test",
+      "request": {
+        "tool": "send_email",
+        "parameters": {
+          "to": "test@example.com",
+          "subject": "Test email",
+          "body": "This is a test",
+          "dry_run": true
+        }
+      },
+      "response": {
+        "success": true,
+        "message_id": null,
+        "timestamp": "2026-02-12T11:06:00Z",
+        "dry_run": true,
+        "error": null
+      }
+    },
+    {
+      "name": "Rate limit exceeded",
+      "request": {
+        "tool": "send_email",
+        "parameters": {
+          "to": "client@example.com",
+          "subject": "Email 21",
+          "body": "This exceeds hourly limit",
+          "dry_run": false
+        }
+      },
+      "response": {
+        "success": false,
+        "message_id": null,
+        "timestamp": "2026-02-12T11:07:00Z",
+        "dry_run": false,
+        "error": "RATE_LIMIT_EXCEEDED: Rate limit exceeded. Maximum 20 emails per hour. Retry after 1800 seconds."
+      }
+    },
+    {
+      "name": "Invalid email address",
+      "request": {
+        "tool": "send_email",
+        "parameters": {
+          "to": "not-an-email",
+          "subject": "Test",
+          "body": "Test body",
+          "dry_run": false
+        }
+      },
+      "response": {
+        "success": false,
+        "message_id": null,
+        "timestamp": "2026-02-12T11:08:00Z",
+        "dry_run": false,
+        "error": "INVALID_EMAIL: Recipient email address is invalid (does not match RFC 5322 format)"
+      }
+    }
+  ],
+  "testing": {
+    "contractTests": [
+      {
+        "name": "Validate email address format",
+        "description": "Ensure invalid email addresses are rejected",
+        "inputs": [
+          "not-an-email",
+          "@example.com",
+          "user@",
+          "user @example.com"
+        ],
+        "expectedError": "INVALID_EMAIL"
+      },
+      {
+        "name": "Validate subject length",
+        "description": "Ensure subject exceeding 500 chars is rejected",
+        "input": {
+          "subject": "A".repeat(501)
+        },
+        "expectedError": "VALIDATION_ERROR"
+      },
+      {
+        "name": "Validate body length",
+        "description": "Ensure body exceeding 50KB is rejected",
+        "input": {
+          "body": "A".repeat(51201)
+        },
+        "expectedError": "VALIDATION_ERROR"
+      },
+      {
+        "name": "Dry run mode",
+        "description": "Ensure dry_run=true does not send actual email",
+        "input": {
+          "dry_run": true
+        },
+        "expectedOutput": {
+          "success": true,
+          "message_id": null,
+          "dry_run": true
+        }
+      },
+      {
+        "name": "Rate limiting enforcement",
+        "description": "Ensure 21st email in an hour is rejected",
+        "setup": "Send 20 emails within an hour",
+        "input": {
+          "to": "test@example.com",
+          "subject": "Email 21",
+          "body": "Test"
+        },
+        "expectedError": "RATE_LIMIT_EXCEEDED"
+      }
+    ]
+  },
+  "security": {
+    "authentication": "OAuth2 with offline access",
+    "credentialStorage": "credentials/gmail_token.json (gitignored)",
+    "secretsManagement": ".env file (gitignored)",
+    "inputValidation": "All parameters validated against schema before processing",
+    "rateLimiting": "Token bucket algorithm prevents quota exhaustion",
+    "auditLogging": "All send attempts logged to /Logs/YYYY-MM-DD.md"
+  }
+}

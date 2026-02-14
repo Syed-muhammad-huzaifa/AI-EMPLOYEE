@@ -208,3 +208,10 @@ Wait for consent; never auto-create ADRs. Group related decisions (stacks, authe
 
 ## Code Standards
 See `.specify/memory/constitution.md` for code quality, testing, performance, security, and architecture principles.
+
+## Active Technologies
+- Python 3.13+ + google-auth, google-api-python-client, MCP SDK for Python, python-dotenv (001-gmail-integration)
+- File-based (Obsidian vault folders: /Needs_Action, /Approved, /Done, /Logs; state persistence: config/gmail_watcher_state.json; credentials: credentials/gmail_token.json, .env) (001-gmail-integration)
+
+## Recent Changes
+- 001-gmail-integration: Added Python 3.13+ + google-auth, google-api-python-client, MCP SDK for Python, python-dotenv

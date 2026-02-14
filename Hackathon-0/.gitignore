@@ -1,0 +1,41 @@
+# ── Secrets & credentials ─────────────────────────────────────────────────────
+.env
+credentials/
+config/gmail_token.pickle
+config/gmail_watcher_state.json
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# ── Browser / Selenium session cache ─────────────────────────────────────────
+config/sessions/
+
+# ── Generated artifacts ───────────────────────────────────────────────────────
+*.pdf
+INV_*.pdf
+
+# ── Windows WSL metadata ──────────────────────────────────────────────────────
+*:Zone.Identifier
+
+# ── OS / IDE ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+.vscode/
+.idea/
