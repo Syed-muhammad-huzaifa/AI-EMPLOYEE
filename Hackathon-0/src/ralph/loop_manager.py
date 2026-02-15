@@ -121,13 +121,14 @@ class RalphLoopManager:
 
                 if 'claude' in cli_name:
                     # Claude CLI arguments
-                    # --max-turns 50: give Claude enough agentic turns for complex tasks
+                    # --max-turns 20: enough for complex multi-step tasks without timeout risk.
+                    #   50 turns × ~18s each = 900s timeout; 20 turns × 18s = 360s max.
                     # --output-format text: simple text output for completion detection
                     cmd = [
                         self.ai_cli_path, '--print',
                         '--dangerously-skip-permissions',
                         '--output-format', 'text',
-                        '--max-turns', '50',
+                        '--max-turns', '20',
                         '--add-dir', vault_path,
                     ]
                 elif 'gemini' in cli_name:
@@ -161,6 +162,12 @@ class RalphLoopManager:
 
                 if result.returncode == 0:
                     logger.info(f"AI CLI completed iteration {iteration + 1}")
+                    # Log a preview of Claude's output to help diagnose empty runs
+                    if result.stdout:
+                        preview = result.stdout.strip()[:300].replace('\n', ' ')
+                        logger.info(f"Claude output preview: {preview}")
+                    else:
+                        logger.warning("Claude produced no stdout output")
 
                     # Check completion via explicit marker
                     if self._is_task_complete(result.stdout):

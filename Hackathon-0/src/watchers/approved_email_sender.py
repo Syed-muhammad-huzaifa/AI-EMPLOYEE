@@ -104,6 +104,7 @@ def parse_draft(content: str) -> Optional[Dict[str, str]]:
     """
     to = subject = body = task_id = action = thread_id = in_reply_to = None
     attachments = []
+    invoice_id = None
 
     # Strip frontmatter block (we'll scan both it and the remainder)
     fm_match = _FRONTMATTER_RE.match(content.strip())
@@ -133,7 +134,7 @@ def parse_draft(content: str) -> Optional[Dict[str, str]]:
         # Scan frontmatter for all known keys
         for line in fm_block.splitlines():
             m = re.match(
-                r"^\s*(to|whatsapp_to|subject|task_id|action|thread_id|in_reply_to|platform)\s*:\s*(.+)",
+                r"^\s*(to|whatsapp_to|subject|task_id|action|thread_id|in_reply_to|platform|invoice_id)\s*:\s*(.+)",
                 line, re.IGNORECASE
             )
             if m:
@@ -153,6 +154,11 @@ def parse_draft(content: str) -> Optional[Dict[str, str]]:
                     in_reply_to = val
                 elif key == "platform" and not platform:
                     platform = val
+                elif key == "invoice_id" and not invoice_id:
+                    try:
+                        invoice_id = int(val)
+                    except (ValueError, TypeError):
+                        pass
         # Scan the body section for **To**: / **Subject**: patterns
         body_lines = after_front.splitlines()
     else:
@@ -219,6 +225,7 @@ def parse_draft(content: str) -> Optional[Dict[str, str]]:
         "thread_id":   thread_id.strip() if thread_id else None,
         "in_reply_to": in_reply_to.strip() if in_reply_to else None,
         "attachments": attachments,
+        "invoice_id":  invoice_id,
     }
 
 
@@ -352,6 +359,206 @@ class ApprovedEmailSender:
                 continue
             self._handle_approved_file(file_path)
 
+    def _intelligent_parse(self, content: str, file_path: Path) -> Optional[Dict]:
+        """
+        Intelligent parser that handles Claude's creative approval formats.
+
+        Extracts:
+        - Email recipient, subject, body from various formats
+        - Gmail draft IDs (fetches draft content)
+        - Invoice IDs (fetches PDF from Odoo)
+        - Normalizes action types
+        """
+        import re
+
+        result = {
+            "to": None,
+            "subject": None,
+            "body": None,
+            "task_id": None,
+            "action": "send_email",
+            "attachments": [],
+            "thread_id": None,
+            "in_reply_to": None,
+        }
+
+        # Extract from YAML frontmatter if present
+        fm_match = re.search(r'^---\s*\n(.*?)\n---', content, re.DOTALL | re.MULTILINE)
+        if fm_match:
+            fm_text = fm_match.group(1)
+
+            # Extract fields
+            for line in fm_text.splitlines():
+                if ':' in line:
+                    key, val = line.split(':', 1)
+                    key = key.strip().lower()
+                    val = val.strip()
+
+                    if key == 'task_id':
+                        result['task_id'] = val
+                    elif key in ('action', 'step_id'):
+                        # Normalize action types
+                        if 'email' in val.lower():
+                            result['action'] = 'send_email'
+
+        # Extract recipient
+        to_match = re.search(r'\*\*To\*\*:\s*([^\n]+)', content, re.IGNORECASE)
+        if not to_match:
+            to_match = re.search(r'(?:Recipient|Customer|Email):\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', content, re.IGNORECASE)
+        if to_match:
+            result['to'] = to_match.group(1).strip()
+
+        # Extract subject
+        subj_match = re.search(r'\*\*Subject\*\*:\s*([^\n]+)', content, re.IGNORECASE)
+        if subj_match:
+            result['subject'] = subj_match.group(1).strip()
+
+        # Extract Gmail draft ID
+        draft_match = re.search(r'Draft ID[:\s]+([a-zA-Z0-9_-]+)', content, re.IGNORECASE)
+        if draft_match:
+            draft_id = draft_match.group(1)
+            self.logger.info(f"Found Gmail draft ID: {draft_id}")
+            # TODO: Fetch draft content from Gmail API
+            # For now, extract body from preview
+
+        # Extract email body from preview section
+        body_match = re.search(r'\*\*Body\*\*:\s*```\s*\n(.*?)\n```', content, re.DOTALL)
+        if body_match:
+            result['body'] = body_match.group(1).strip()
+
+        # Extract invoice ID and fetch PDF
+        inv_match = re.search(r'Invoice (?:ID|Number)[:\s]+(\d+|INV[/\-]?\d+[/\-]?\d+)', content, re.IGNORECASE)
+        if inv_match:
+            invoice_ref = inv_match.group(1)
+            self.logger.info(f"Found invoice reference: {invoice_ref}")
+
+            # Extract numeric ID
+            inv_id_match = re.search(r'Invoice ID[:\s]+(\d+)', content, re.IGNORECASE)
+            if inv_id_match:
+                invoice_id = int(inv_id_match.group(1))
+                pdf_data = self._fetch_invoice_pdf(invoice_id)
+                if pdf_data:
+                    result['attachments'].append(pdf_data)
+
+        # Validate required fields
+        if not result['to'] or not result['subject']:
+            return None
+
+        return result
+
+    def _fetch_invoice_pdf(self, invoice_id: int) -> Optional[Dict]:
+        """
+        Fetch PDF from Odoo by calling the Odoo API directly.
+        Uses the same credentials and approach as the Odoo MCP server.
+        """
+        try:
+            import requests
+
+            odoo_url  = os.getenv("ODOO_URL", "http://localhost:8069").rstrip("/")
+            odoo_db   = os.getenv("ODOO_DB", "MYdb")
+            odoo_user = os.getenv("ODOO_USER", "iam@gmail.com")
+            odoo_pass = os.getenv("ODOO_PASSWORD", "admin123")
+
+            session = requests.Session()
+
+            # Authenticate
+            auth_resp = session.post(
+                f"{odoo_url}/web/session/authenticate",
+                json={"jsonrpc": "2.0", "method": "call", "id": 1,
+                      "params": {"db": odoo_db, "login": odoo_user, "password": odoo_pass}},
+                timeout=15,
+            )
+            auth_resp.raise_for_status()
+            auth_result = auth_resp.json().get("result", {})
+            if not auth_result.get("uid"):
+                self.logger.error("Odoo authentication failed — check ODOO_USER/ODOO_PASSWORD")
+                return None
+
+            # Get invoice name
+            inv_resp = session.post(
+                f"{odoo_url}/web/dataset/call_kw",
+                json={"jsonrpc": "2.0", "method": "call", "id": 2,
+                      "params": {"model": "account.move", "method": "read",
+                                 "args": [[invoice_id]], "kwargs": {"fields": ["name", "state"]}}},
+                timeout=15,
+            )
+            inv_data = inv_resp.json().get("result", [])
+            if not inv_data:
+                self.logger.error(f"Invoice {invoice_id} not found in Odoo")
+                return None
+
+            inv = inv_data[0]
+            if inv.get("state") != "posted":
+                self.logger.warning(f"Invoice {inv.get('name')} is not posted — cannot generate PDF")
+                return None
+
+            invoice_number = inv["name"]
+
+            # Fetch PDF via HTTP report endpoint
+            report_url = f"{odoo_url}/report/pdf/account.report_invoice/{invoice_id}"
+            pdf_resp = session.get(report_url, timeout=30)
+            pdf_resp.raise_for_status()
+
+            pdf_bytes = pdf_resp.content
+            if not pdf_bytes:
+                self.logger.error(f"Empty PDF returned for invoice {invoice_id}")
+                return None
+
+            filename = f"{invoice_number.replace('/', '_')}.pdf"
+            pdf_base64 = base64.b64encode(pdf_bytes).decode("utf-8")
+
+            self.logger.info(
+                f"Fetched PDF for {invoice_number} ({len(pdf_bytes):,} bytes) → {filename}"
+            )
+            return {
+                "filename": filename,
+                "content_base64": pdf_base64,
+                "mime_type": "application/pdf",
+            }
+
+        except Exception as exc:
+            self.logger.error(f"Error fetching invoice PDF for ID {invoice_id}: {exc}")
+            return None
+
+    def _enrich_with_invoice_pdf(self, draft: Dict, content: str) -> None:
+        """
+        Post-parse enrichment: fetch invoice PDF from Odoo and add to attachments.
+        Runs after parsing succeeds. Mutates draft['attachments'] in place.
+        No-op if attachments are already present.
+        """
+        if draft.get("attachments"):
+            return  # already has attachments
+
+        # Prefer invoice_id parsed from YAML frontmatter (clean, reliable)
+        invoice_id = draft.get("invoice_id")
+
+        # Fallback: scan raw content for patterns like "invoice_id: 70" or "Invoice ID: 70"
+        if not invoice_id:
+            inv_id_match = re.search(
+                r'(?:^invoice_id|Invoice\s+ID)[:\s*]+(\d+)',
+                content, re.IGNORECASE | re.MULTILINE
+            )
+            if inv_id_match:
+                try:
+                    invoice_id = int(inv_id_match.group(1))
+                except (ValueError, TypeError):
+                    pass
+
+        if not invoice_id:
+            return  # no invoice reference found
+
+        self.logger.info(f"Enriching email with PDF for invoice ID {invoice_id}")
+        pdf_data = self._fetch_invoice_pdf(invoice_id)
+        if pdf_data:
+            if not isinstance(draft.get("attachments"), list):
+                draft["attachments"] = []
+            draft["attachments"].append(pdf_data)
+            self.logger.info(f"Attached PDF: {pdf_data['filename']}")
+        else:
+            self.logger.warning(
+                f"Could not fetch PDF for invoice {invoice_id} — sending without attachment"
+            )
+
     def _handle_approved_file(self, file_path: Path):
         self.logger.info(f"Processing approved file: {file_path.name}")
 
@@ -361,14 +568,22 @@ class ApprovedEmailSender:
             self.logger.error(f"Could not read {file_path}: {exc}")
             return
 
+        # Try to parse as standard format first
         draft = parse_draft(content)
+
+        # If standard parsing fails, try intelligent parsing
+        if not draft:
+            draft = self._intelligent_parse(content, file_path)
+
         if not draft:
             self.logger.warning(
-                f"Could not parse fields from {file_path.name} — "
-                "expected at minimum 'to:' (and 'subject:' for email). Moving to Rejected/."
+                f"Could not parse fields from {file_path.name}. Moving to Rejected/."
             )
             self._move(file_path, self.rejected_dir, reason="parse_failed")
             return
+
+        # Always enrich: if content mentions invoice IDs but no attachments yet, fetch PDF
+        self._enrich_with_invoice_pdf(draft, content)
 
         action      = draft.get("action", "send_email")
         to          = draft["to"]
@@ -611,21 +826,6 @@ class ApprovedEmailSender:
             else:
                 error_msg = result.stderr.strip() if result.stderr else "Unknown error"
                 self.logger.error(f"❌ Facebook post failed: {error_msg}")
-                self._move(file_path, self.rejected_dir, reason="facebook_post_failed")
-        except Exception as exc:
-            self.logger.error(f"Facebook post error: {exc}")
-            self._move(file_path, self.rejected_dir, reason=str(exc))
-            success = FacebookWatcher(str(self.vault)).post_to_facebook(body)
-            if success:
-                self.logger.info("✅ Facebook post published")
-                self.vault_manager.log_activity(
-                    "Facebook post published",
-                    {"file": file_path.name},
-                )
-                self._move(file_path, self.done_dir, reason="posted")
-                self._close_original_task(task_id, reason="facebook_posted")
-            else:
-                self.logger.error("❌ Facebook post failed")
                 self._move(file_path, self.rejected_dir, reason="facebook_post_failed")
         except Exception as exc:
             self.logger.error(f"Facebook post error: {exc}")

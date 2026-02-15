@@ -248,18 +248,17 @@ The ApprovedEmailSender parses this file automatically.
 
 #### Email with PDF Attachment (e.g., Invoice)
 
+⚠️ **DO NOT embed base64 PDF content in the approval file.**
+The system automatically fetches and attaches the PDF from Odoo using the `invoice_id`.
+Just include the `invoice_id` — the ApprovedEmailSender handles the rest.
+
 ```markdown
 ---
 action: send_email
 task_id: invoice_task_123
 to: customer@example.com
-subject: Invoice #INV-2026-001 - Your Company Name
-thread_id: 18a1b2c3d4e5f6g7
-in_reply_to: <message-id@mail.gmail.com>
-attachments:
-  - filename: INV-2026-001.pdf
-    content_base64: JVBERi0xLjQKJeLjz9MKMyAwIG9iago8PC9UeXBlL1BhZ2UvUGFyZW50IDIgMCBSL1Jlc291cmNlczw8L0ZvbnQ8PC9GMSA1IDAgUj4+L1Byb2NTZXRbL1BERi9UZXh0L0ltYWdlQi9JbWFnZUMvSW1hZ2VJXT4+L01lZGlhQm94WzAgMCA2MTIgNzkyXS9Db250ZW50cyA0IDAgUi9Hcm91cDw8L1R5cGUvR3JvdXAvUy9UcmFuc3BhcmVuY3kvQ1MvRGV2aWNlUkdCPj4vVGFicz...
-    mime_type: application/pdf
+subject: Invoice #INV-2026-001 - Consulting Services
+invoice_id: 70
 ---
 
 Dear Customer,
@@ -281,10 +280,10 @@ Your Company
 1. `action: send_email` (exact string, not "send_email_with_invoice")
 2. `to:` field is REQUIRED
 3. `subject:` field is REQUIRED for emails
-4. `attachments:` is a YAML array (use proper indentation)
-5. `content_base64:` must contain the FULL base64 string from get_invoice_pdf
-6. Email body goes AFTER the `---` closing the YAML frontmatter
-7. `thread_id` and `in_reply_to` are optional (for email replies)
+4. `invoice_id:` include the numeric Odoo invoice ID — system auto-attaches the PDF
+5. Email body goes AFTER the `---` closing the YAML frontmatter
+6. `thread_id` and `in_reply_to` are optional (for email replies)
+7. **NEVER** include `content_base64` — that's too large and breaks the system
 
 #### Email without Attachment
 
