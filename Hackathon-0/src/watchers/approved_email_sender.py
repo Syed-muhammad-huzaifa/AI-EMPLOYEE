@@ -736,7 +736,7 @@ class ApprovedEmailSender:
             post_script = Path(__file__).parent.parent.parent / "scripts" / "post_social.py"
             result = subprocess.run(
                 ["python3", str(post_script), "linkedin", body],
-                capture_output=True, text=True, timeout=60
+                capture_output=True, text=True, timeout=120
             )
 
             if result.returncode == 0:
@@ -774,7 +774,7 @@ class ApprovedEmailSender:
             post_script = Path(__file__).parent.parent.parent / "scripts" / "post_social.py"
             result = subprocess.run(
                 ["python3", str(post_script), "twitter", body],
-                capture_output=True, text=True, timeout=60
+                capture_output=True, text=True, timeout=120
             )
 
             if result.returncode == 0:
@@ -812,7 +812,7 @@ class ApprovedEmailSender:
             post_script = Path(__file__).parent.parent.parent / "scripts" / "post_social.py"
             result = subprocess.run(
                 ["python3", str(post_script), "facebook", body],
-                capture_output=True, text=True, timeout=60
+                capture_output=True, text=True, timeout=120
             )
 
             if result.returncode == 0:
@@ -854,7 +854,7 @@ class ApprovedEmailSender:
                     ["python3", str(post_script), "linkedin", linkedin_text],
                     capture_output=True,
                     text=True,
-                    timeout=60
+                    timeout=120
                 )
                 success = result.returncode == 0
                 results.append(("LinkedIn", success))
@@ -875,7 +875,7 @@ class ApprovedEmailSender:
                     ["python3", str(post_script), "twitter", twitter_text],
                     capture_output=True,
                     text=True,
-                    timeout=60
+                    timeout=120
                 )
                 success = result.returncode == 0
                 results.append(("Twitter", success))
@@ -896,7 +896,7 @@ class ApprovedEmailSender:
                     ["python3", str(post_script), "facebook", facebook_text],
                     capture_output=True,
                     text=True,
-                    timeout=60
+                    timeout=120
                 )
                 success = result.returncode == 0
                 results.append(("Facebook", success))
