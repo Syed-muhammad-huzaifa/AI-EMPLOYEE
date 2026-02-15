@@ -241,12 +241,70 @@ def enforce_hitl(action_type, action_data):
     # (detected by file move to /Approved/)
 ```
 
-### Approval File Format
+### Approval File Format (CRITICAL - EXACT FORMAT REQUIRED)
+
+**IMPORTANT**: The approval file MUST be machine-readable YAML + Markdown.
+The ApprovedEmailSender parses this file automatically.
+
+#### Email with PDF Attachment (e.g., Invoice)
 
 ```markdown
-# /Pending_Approval/{ACTION}_{TASK_ID}.md
-
 ---
+action: send_email
+task_id: invoice_task_123
+to: customer@example.com
+subject: Invoice #INV-2026-001 - Your Company Name
+thread_id: 18a1b2c3d4e5f6g7
+in_reply_to: <message-id@mail.gmail.com>
+attachments:
+  - filename: INV-2026-001.pdf
+    content_base64: JVBERi0xLjQKJeLjz9MKMyAwIG9iago8PC9UeXBlL1BhZ2UvUGFyZW50IDIgMCBSL1Jlc291cmNlczw8L0ZvbnQ8PC9GMSA1IDAgUj4+L1Byb2NTZXRbL1BERi9UZXh0L0ltYWdlQi9JbWFnZUMvSW1hZ2VJXT4+L01lZGlhQm94WzAgMCA2MTIgNzkyXS9Db250ZW50cyA0IDAgUi9Hcm91cDw8L1R5cGUvR3JvdXAvUy9UcmFuc3BhcmVuY3kvQ1MvRGV2aWNlUkdCPj4vVGFicz...
+    mime_type: application/pdf
+---
+
+Dear Customer,
+
+Please find attached your invoice for services rendered.
+
+Invoice Details:
+- Invoice Number: INV-2026-001
+- Amount: $250.00
+- Due Date: March 17, 2026
+
+Thank you for your business!
+
+Best regards,
+Your Company
+```
+
+**Key Requirements**:
+1. `action: send_email` (exact string, not "send_email_with_invoice")
+2. `to:` field is REQUIRED
+3. `subject:` field is REQUIRED for emails
+4. `attachments:` is a YAML array (use proper indentation)
+5. `content_base64:` must contain the FULL base64 string from get_invoice_pdf
+6. Email body goes AFTER the `---` closing the YAML frontmatter
+7. `thread_id` and `in_reply_to` are optional (for email replies)
+
+#### Email without Attachment
+
+```markdown
+---
+action: send_email
+task_id: reply_task_456
+to: customer@example.com
+subject: Re: Your inquiry
+thread_id: 18a1b2c3d4e5f6g7
+in_reply_to: <message-id@mail.gmail.com>
+---
+
+Dear Customer,
+
+Thank you for reaching out. Here's the information you requested...
+
+Best regards,
+Your Company
+```
 action: send_email | post_social | make_payment
 task_id: EMAIL_client_001
 created: 2026-01-07T10:00:00Z
