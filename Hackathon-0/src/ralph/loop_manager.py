@@ -121,10 +121,13 @@ class RalphLoopManager:
 
                 if 'claude' in cli_name:
                     # Claude CLI arguments
+                    # --max-turns 50: give Claude enough agentic turns for complex tasks
+                    # --output-format text: simple text output for completion detection
                     cmd = [
                         self.ai_cli_path, '--print',
                         '--dangerously-skip-permissions',
                         '--output-format', 'text',
+                        '--max-turns', '50',
                         '--add-dir', vault_path,
                     ]
                 elif 'gemini' in cli_name:
@@ -151,18 +154,45 @@ class RalphLoopManager:
                     input=stdin_input,
                     text=True,
                     capture_output=True,
-                    cwd=str(_REPO_ROOT),
+                    cwd=str(_REPO_ROOT),  # AI-EMPLOYEE/ root where .mcp.json lives
                     env=clean_env,
-                    timeout=300,  # 5 minute timeout
+                    timeout=900,  # 15 minute timeout for complex multi-step tasks
                 )
 
                 if result.returncode == 0:
                     logger.info(f"AI CLI completed iteration {iteration + 1}")
 
-                    # Check completion: either promise marker OR task file moved to Done
-                    if self._is_task_complete(result.stdout) or self._is_task_complete_in_vault(task_file):
-                        logger.info("Task completed successfully")
+                    # Check completion via explicit marker
+                    if self._is_task_complete(result.stdout):
+                        logger.info("Task completed (explicit marker found)")
                         return result.stdout
+
+                    # Check completion via vault state (task file moved out of In_Progress)
+                    if self._is_task_complete_in_vault(task_file):
+                        logger.info("Task completed (file moved to Done)")
+                        return result.stdout
+
+                    # Claude returned 0 but task file is gone (moved somewhere else)
+                    # Trust that Claude did its job even without the exact marker
+                    if task_file and not task_file.exists():
+                        logger.info("Task file no longer in In_Progress — treating as complete")
+                        return result.stdout
+
+                    # Claude returned 0 but task still in place — likely wrote to
+                    # Pending_Approval (HITL). Check for that.
+                    pending = self.vault_manager.vault_path / "Pending_Approval"
+                    if task_file and any(pending.glob(f"*{task_file.stem}*")):
+                        logger.info("Task moved to Pending_Approval (HITL) — complete")
+                        return result.stdout
+
+                    # returncode=0 but no completion detected — don't retry with same
+                    # prompt (would duplicate work). Log and exit loop.
+                    logger.warning(
+                        f"Claude returned 0 on iteration {iteration + 1} but no "
+                        "completion detected. Treating as done to avoid duplicate actions."
+                    )
+                    return result.stdout
+
                 else:
                     error_msg = (
                         f"AI CLI failed on iteration {iteration + 1} | "
@@ -196,24 +226,43 @@ class RalphLoopManager:
                 logger.info(f"Task not yet complete, continuing loop ({iteration + 1}/{self.max_iterations})")
                 
             except subprocess.TimeoutExpired as e:
-                logger.error(f"Claude subprocess timed out on iteration {iteration + 1}")
+                logger.error(f"AI CLI subprocess timed out on iteration {iteration + 1} (900s timeout)")
                 self.vault_manager.log_activity(
                     "Ralph loop timeout",
-                    {"iteration": iteration + 1, "timeout": "300s", "prompt_length": len(prompt)}
+                    {"iteration": iteration + 1, "timeout": "900s", "prompt_length": len(prompt)}
                 )
-                if iteration >= self.max_iterations - 1:
-                    raise Exception(f"Claude subprocess timed out after {iteration + 1} iterations") from e
+                # Don't retry timeouts - they indicate the task is too complex
+                # Move to Failed and let human review
+                if task_file:
+                    failed_dir = self.vault_manager.vault_path / "Failed"
+                    failed_dir.mkdir(exist_ok=True)
+                    try:
+                        if task_file.exists():
+                            self.vault_manager.move_file(task_file, failed_dir)
+                            logger.info(f"Moved timed-out task to Failed/: {task_file.name}")
+                    except Exception as move_err:
+                        logger.error(f"Could not move timed-out task: {move_err}")
+                raise Exception(f"AI CLI timed out after 900s on iteration {iteration + 1}") from e
 
             except subprocess.SubprocessError as e:
-                logger.error(f"Error calling Claude in Ralph loop iteration {iteration + 1}: {e}")
-
+                logger.error(f"Subprocess error on iteration {iteration + 1}: {e}", exc_info=True)
                 self.vault_manager.log_activity(
-                    "Ralph loop Claude error",
+                    "Ralph loop subprocess error",
                     {"iteration": iteration + 1, "error": str(e), "prompt_length": len(prompt)},
                 )
-
+                # Continue to next iteration for transient errors
                 if iteration >= self.max_iterations - 1:
-                    raise  # re-raise preserving original traceback
+                    # Max retries exceeded
+                    if task_file:
+                        failed_dir = self.vault_manager.vault_path / "Failed"
+                        failed_dir.mkdir(exist_ok=True)
+                        try:
+                            if task_file.exists():
+                                self.vault_manager.move_file(task_file, failed_dir)
+                                logger.info(f"Moved failed task to Failed/: {task_file.name}")
+                        except Exception as move_err:
+                            logger.error(f"Could not move failed task: {move_err}")
+                    raise Exception(f"Subprocess error after {iteration + 1} iterations") from e
 
             except ValueError as e:
                 # Input validation errors should fail immediately without retrying.
@@ -223,22 +272,27 @@ class RalphLoopManager:
             iteration += 1
             time.sleep(self.check_interval)
         
-        # If we reach here, max iterations were exceeded
+        # If we reach here, max iterations were exceeded without completion
         logger.error(f"Max iterations ({self.max_iterations}) exceeded in Ralph loop")
-        
+
         # Log the failure
         self.vault_manager.log_activity(
-            "Ralph loop failure",
+            "Ralph loop max iterations exceeded",
             {"max_iterations": self.max_iterations, "prompt_length": len(prompt)}
         )
-        
+
         # Move task to Failed folder if task_file is provided
         if task_file:
             failed_dir = self.vault_manager.vault_path / "Failed"
             failed_dir.mkdir(exist_ok=True)
-            self.vault_manager.move_file(task_file, failed_dir)
-        
-        raise Exception(f"Ralph loop failed after {self.max_iterations} iterations")
+            try:
+                if task_file.exists():
+                    self.vault_manager.move_file(task_file, failed_dir)
+                    logger.info(f"Moved task to Failed/ after max iterations: {task_file.name}")
+            except Exception as e:
+                logger.error(f"Could not move task to Failed/: {e}")
+
+        raise Exception(f"Ralph loop failed: max iterations ({self.max_iterations}) exceeded")
     
     def _is_task_complete_in_vault(self, task_file: Path = None) -> bool:
         """

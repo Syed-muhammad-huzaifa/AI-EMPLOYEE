@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "gmail": {
+      "command": "python",
+      "args": ["/home/syedhuzaifa/AI-EMPLOYEE/Hackathon-0/mcp-servers/email-mcp/email-mcp.py"],
+      "env": {
+        "GMAIL_RATE_LIMIT_HOURLY": "20",
+        "GMAIL_RATE_LIMIT_DAILY": "100",
+        "DRY_RUN": "false"
+      }
+    },
+    "odoo": {
+      "command": "python",
+      "args": ["/home/syedhuzaifa/AI-EMPLOYEE/Hackathon-0/mcp-servers/odoo-mcp/odoo-mcp.py"]
+    }
+  }
+}
