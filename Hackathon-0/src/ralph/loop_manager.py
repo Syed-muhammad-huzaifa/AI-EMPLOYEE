@@ -366,7 +366,8 @@ class RalphLoopManager:
 
 if __name__ == "__main__":
     from src.utils.logger import setup_logging
+    from src.orchestrator.controller import OrchestratorController
 
     setup_logging()
-    manager = RalphLoopManager()
-    manager.run()
+    controller = OrchestratorController()
+    controller.start_monitoring(check_interval=5)
