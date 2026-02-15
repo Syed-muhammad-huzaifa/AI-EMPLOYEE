@@ -347,10 +347,10 @@ class RalphLoopManager:
     def monitor_completion_marker(self, file_path: Path) -> bool:
         """
         Monitor a file for the completion marker.
-        
+
         Args:
             file_path: Path to the file to monitor
-            
+
         Returns:
             Boolean indicating if the completion marker was found
         """
@@ -360,3 +360,13 @@ class RalphLoopManager:
         except Exception as e:
             logger.error(f"Error reading file {file_path} for completion marker: {e}")
             return False
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    from src.utils.logger import setup_logging
+
+    setup_logging()
+    manager = RalphLoopManager()
+    manager.run()

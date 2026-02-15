@@ -1054,3 +1054,12 @@ class ApprovedEmailSender:
             self.logger.info(f"Moved {src.name} → {dest_dir.name}/{dest.name} [{reason}]")
         except Exception as exc:
             self.logger.error(f"Could not move {src}: {exc}")
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    from src.utils.logger import setup_logging
+
+    setup_logging()
+    ApprovedEmailSender().run()
