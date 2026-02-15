@@ -303,20 +303,41 @@ def create_invoice(
             }],
         )
 
-        # Get invoice number
+        # CRITICAL: Post the invoice immediately so PDF can be generated
+        # Invoices in 'draft' state cannot generate PDFs
+        try:
+            client.call(
+                "account.move",
+                "action_post",
+                args=[[invoice_id]],
+            )
+            logger.info(f"Invoice {invoice_id} posted successfully")
+        except Exception as post_error:
+            logger.error(f"Failed to post invoice {invoice_id}: {post_error}")
+            # Don't fail - return the invoice but warn it's in draft
+            return {
+                "success": True,
+                "invoice_id": invoice_id,
+                "invoice_number": "DRAFT",
+                "warning": f"Invoice created but not posted: {post_error}",
+                "error": None,
+            }
+
+        # Get invoice number after posting
         invoice = client.call(
             "account.move",
             "read",
             args=[[invoice_id]],
-            kwargs={"fields": ["name"]},
+            kwargs={"fields": ["name", "state"]},
         )
 
-        logger.info(f"Invoice created: {invoice[0]['name']} for {customer_email}")
+        logger.info(f"Invoice created and posted: {invoice[0]['name']} for {customer_email}")
 
         return {
             "success": True,
             "invoice_id": invoice_id,
             "invoice_number": invoice[0]["name"],
+            "state": invoice[0].get("state", "unknown"),
             "error": None,
         }
 

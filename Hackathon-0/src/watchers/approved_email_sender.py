@@ -29,6 +29,7 @@ import os
 import re
 import sys
 import time
+import yaml
 import pickle
 import base64
 import logging
@@ -37,6 +38,8 @@ from typing import Optional, Dict, Tuple
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
@@ -85,15 +88,22 @@ _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)", re.DOTALL)
 def parse_draft(content: str) -> Optional[Dict[str, str]]:
     """
     Parse a draft markdown file into {to, subject, body, task_id, action,
-    thread_id, in_reply_to}.
+    thread_id, in_reply_to, attachments}.
     Returns None if required fields (to, subject) are missing.
 
     Handles three layouts:
       1. YAML frontmatter with to:/subject:/task_id: keys  (skill HITL format)
       2. YAML frontmatter (other keys) + **To**:/**Subject**: in the body
       3. Plain inline "To: ..." / "**To**: ..." lines (no frontmatter)
+
+    Attachments format in frontmatter:
+      attachments:
+        - filename: invoice.pdf
+          content_base64: <base64-encoded-data>
+          mime_type: application/pdf
     """
     to = subject = body = task_id = action = thread_id = in_reply_to = None
+    attachments = []
 
     # Strip frontmatter block (we'll scan both it and the remainder)
     fm_match = _FRONTMATTER_RE.match(content.strip())
@@ -101,6 +111,25 @@ def parse_draft(content: str) -> Optional[Dict[str, str]]:
     if fm_match:
         fm_block    = fm_match.group(1)
         after_front = fm_match.group(2).strip()
+
+        # Parse attachments from YAML frontmatter
+        # Format: attachments: [{filename: x, content_base64: y, mime_type: z}]
+        import yaml
+        try:
+            fm_data = yaml.safe_load(fm_block)
+            if isinstance(fm_data, dict) and "attachments" in fm_data:
+                att_list = fm_data["attachments"]
+                if isinstance(att_list, list):
+                    for att in att_list:
+                        if isinstance(att, dict):
+                            attachments.append({
+                                "filename": att.get("filename", "attachment.bin"),
+                                "content_base64": att.get("content_base64", ""),
+                                "mime_type": att.get("mime_type", "application/octet-stream"),
+                            })
+        except Exception:
+            pass  # YAML parsing failed, continue with line-by-line parsing
+
         # Scan frontmatter for all known keys
         for line in fm_block.splitlines():
             m = re.match(
@@ -189,20 +218,26 @@ def parse_draft(content: str) -> Optional[Dict[str, str]]:
         "action":      _action,
         "thread_id":   thread_id.strip() if thread_id else None,
         "in_reply_to": in_reply_to.strip() if in_reply_to else None,
+        "attachments": attachments,
     }
 
 
 # ── Sender ────────────────────────────────────────────────────────────────────
 
 def _send_with_retry(service, to: str, subject: str, body: str,
+                     attachments: list = None,
                      thread_id: Optional[str] = None,
                      in_reply_to: Optional[str] = None,
                      max_retries: int = 3) -> Tuple[bool, str]:
     """
-    Send email, retry on transient errors.
+    Send email with optional attachments, retry on transient errors.
     Pass thread_id + in_reply_to to reply in the same Gmail thread.
+
+    attachments: list of dicts with {filename, content_base64, mime_type}
+
     Returns (success: bool, message_id_or_error: str).
     """
+    attachments = attachments or []
     backoff = 1
     for attempt in range(1, max_retries + 1):
         try:
@@ -213,6 +248,32 @@ def _send_with_retry(service, to: str, subject: str, body: str,
                 mime["In-Reply-To"] = in_reply_to
                 mime["References"]  = in_reply_to
             mime.attach(MIMEText(body, "plain"))
+
+            # Attach files
+            for att in attachments:
+                filename = att.get("filename", "attachment.bin")
+                content_b64 = att.get("content_base64", "")
+                mime_type = att.get("mime_type", "application/octet-stream")
+
+                if not content_b64:
+                    logger.warning(f"Skipping empty attachment: {filename}")
+                    continue
+
+                try:
+                    # Decode base64 content
+                    file_data = base64.b64decode(content_b64)
+
+                    # Create MIME attachment
+                    part = MIMEBase(*mime_type.split("/", 1))
+                    part.set_payload(file_data)
+                    encoders.encode_base64(part)
+                    part.add_header("Content-Disposition", f"attachment; filename={filename}")
+                    mime.attach(part)
+                    logger.info(f"Attached file: {filename} ({len(file_data)} bytes)")
+                except Exception as att_error:
+                    logger.error(f"Failed to attach {filename}: {att_error}")
+                    # Continue with other attachments
+
             raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
             send_body: Dict = {"raw": raw}
             if thread_id:
@@ -316,6 +377,7 @@ class ApprovedEmailSender:
         task_id     = draft.get("task_id")
         thread_id   = draft.get("thread_id")
         in_reply_to = draft.get("in_reply_to")
+        attachments = draft.get("attachments", [])
 
         # ── Route to correct channel ──────────────────────────────────────────
         if action == "send_whatsapp":
@@ -347,7 +409,13 @@ class ApprovedEmailSender:
             self._handle_multi_platform_post(file_path, draft, task_id)
             return
 
-        self.logger.info(f"Sending email → to=** {to} | subject=** {subject[:60]}")
+        self.logger.info(f"Sending email → to={to} | subject={subject[:60]}")
+
+        # Log attachment info if present
+        if attachments:
+            att_summary = ", ".join(f"{a['filename']} ({a.get('mime_type', 'unknown')})" for a in attachments)
+            self.logger.info(f"Attachments: {att_summary}")
+
 
         # ── Dry run ──────────────────────────────────────────────────────────
         if self.dry_run:
@@ -367,6 +435,7 @@ class ApprovedEmailSender:
             service          = _load_service()
             success, msg_ref = _send_with_retry(
                 service, to, subject, body,
+                attachments=attachments,
                 thread_id=thread_id, in_reply_to=in_reply_to
             )
         except RuntimeError as exc:

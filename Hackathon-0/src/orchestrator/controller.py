@@ -100,7 +100,7 @@ class OrchestratorController:
             vault_path = self.vault_manager.vault_path
             task_content = self.vault_manager.read_file(task_file)
 
-            # Simple, clean prompt that invokes the skill
+            # Simple, clean prompt - let Claude be intelligent
             prompt = f"""Process this task using the /process-needs-action skill.
 
 Task File: {task_file}
@@ -110,12 +110,13 @@ Task Content:
 {task_content}
 
 Instructions:
-1. If no plan exists, call /task-planner to create one
-2. Execute the plan step by step
-3. For any outbound action (email, payment, etc), write to Pending_Approval/ and STOP
-4. When complete, move task to Done/ and output: <promise>TASK_COMPLETE</promise>
+1. Read and understand the task context
+2. If no plan exists, call /task-planner to create one
+3. Execute the plan step by step, adapting as needed
+4. For outbound actions (emails, payments, posts), create approval file in Pending_Approval/
+5. When complete, move task to Done/ and output: <promise>TASK_COMPLETE</promise>
 
-Use the MCP servers (gmail, odoo) as needed for execution.
+Use MCP servers (gmail, odoo) and your judgment to complete the task professionally.
 """
 
             self.vault_manager.log_activity(
