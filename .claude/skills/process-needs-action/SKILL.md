@@ -246,6 +246,28 @@ def enforce_hitl(action_type, action_data):
 **IMPORTANT**: The approval file MUST be machine-readable YAML + Markdown.
 The ApprovedEmailSender parses this file automatically.
 
+⚠️ **CRITICAL OUTPUT RULES - READ CAREFULLY**:
+
+1. **NO MARKDOWN FORMATTING** in email body or social posts:
+   - ❌ NO headers: `##`, `###`, `####`
+   - ❌ NO bold: `**text**` or `__text__`
+   - ❌ NO lists: `- item` or `* item`
+   - ❌ NO code blocks: ` ``` `
+   - ❌ NO horizontal rules: `---` or `***`
+   - ✅ USE plain text with natural line breaks
+
+2. **NO INTERNAL REASONING** in outputs:
+   - ❌ NO meta-commentary: "Let me draft...", "I'll create...", "Here's what I'm thinking..."
+   - ❌ NO processing steps: "Step 1:", "First, I will...", "Next, we should..."
+   - ❌ NO explanations: "This email will...", "The purpose is..."
+   - ✅ ONLY the actual message content
+
+3. **WRITE LIKE A HUMAN**:
+   - ✅ Natural, conversational tone
+   - ✅ Direct communication
+   - ✅ Professional but warm
+   - ✅ No technical artifacts
+
 #### Email with PDF Attachment (e.g., Invoice)
 
 ⚠️ **DO NOT embed base64 PDF content in the approval file.**
@@ -265,10 +287,9 @@ Dear Customer,
 
 Please find attached your invoice for services rendered.
 
-Invoice Details:
-- Invoice Number: INV-2026-001
-- Amount: $250.00
-- Due Date: March 17, 2026
+Invoice Number: INV-2026-001
+Amount: $250.00
+Due Date: March 17, 2026
 
 Thank you for your business!
 
@@ -284,6 +305,8 @@ Your Company
 5. Email body goes AFTER the `---` closing the YAML frontmatter
 6. `thread_id` and `in_reply_to` are optional (for email replies)
 7. **NEVER** include `content_base64` — that's too large and breaks the system
+8. **NEVER** use markdown formatting in the body — plain text only
+9. **NEVER** include internal reasoning or meta-commentary
 
 #### Email without Attachment
 
@@ -299,9 +322,43 @@ in_reply_to: <message-id@mail.gmail.com>
 
 Dear Customer,
 
-Thank you for reaching out. Here's the information you requested...
+Thank you for reaching out. Here's the information you requested:
+
+We offer three service tiers:
+- Basic: $99/month
+- Professional: $199/month
+- Enterprise: Custom pricing
+
+I'd be happy to schedule a call to discuss which option fits your needs best.
 
 Best regards,
+Your Company
+```
+
+#### Social Media Post (LinkedIn/Twitter/Facebook)
+
+```markdown
+---
+action: post_linkedin
+task_id: social_post_123
+---
+
+Excited to share that we've just launched our new AI-powered customer service platform!
+
+After 6 months of development, we're helping businesses respond to customer inquiries 10x faster while maintaining that personal touch.
+
+Interested in learning more? Drop a comment or send me a message.
+```
+
+**Social Post Rules**:
+- ❌ NO markdown headers (`##`)
+- ❌ NO bold/italic formatting (`**`, `__`)
+- ❌ NO bullet lists with `-` or `*`
+- ❌ NO meta-commentary ("Here's my post:", "I'm sharing...")
+- ✅ Natural, conversational tone
+- ✅ Emojis are OK (but use sparingly)
+- ✅ Hashtags are OK at the end
+- ✅ Line breaks for readability
 Your Company
 ```
 action: send_email | post_social | make_payment

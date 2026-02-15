@@ -85,6 +85,62 @@ def _load_service():
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)", re.DOTALL)
 
 
+def _clean_output_text(text: str) -> str:
+    """
+    Clean markdown formatting and meta-commentary from email/social post text.
+    Makes output look human-written, not AI-generated.
+
+    Removes:
+    - Markdown headers (##, ###)
+    - Markdown bold (**text**)
+    - Markdown lists (- item, * item)
+    - Meta-commentary ("Let me draft...", "Here's what I'm thinking...")
+    - Processing steps ("Step 1:", "First, I will...")
+
+    Preserves:
+    - Natural line breaks
+    - Paragraph structure
+    - Emojis and hashtags
+    """
+    if not text:
+        return text
+
+    # Remove meta-commentary patterns (case-insensitive)
+    meta_patterns = [
+        r"(?i)^.*?(?:let me|i'll|i will|here's what|i'm thinking|i'm going to).*?\n",
+        r"(?i)^.*?(?:step \d+:|first,|next,|then,|finally,).*?\n",
+        r"(?i)^.*?(?:this (?:email|post|message) will|the purpose is).*?\n",
+        r"(?i)^## (?:action summary|draft|preview|email body|to approve).*?\n",
+    ]
+    for pattern in meta_patterns:
+        text = re.sub(pattern, "", text, flags=re.MULTILINE)
+
+    # Remove markdown headers (## Header, ### Header)
+    text = re.sub(r'^#{1,6}\s+(.+)$', r'\1', text, flags=re.MULTILINE)
+
+    # Convert markdown bold to plain text (**text** or __text__)
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+
+    # Convert markdown lists to natural text
+    # "- Item" or "* Item" → "Item"
+    text = re.sub(r'^[\s]*[-*]\s+', '', text, flags=re.MULTILINE)
+
+    # Remove horizontal rules (---, ***)
+    text = re.sub(r'^[\s]*[-*]{3,}[\s]*$', '', text, flags=re.MULTILINE)
+
+    # Remove code blocks (```...```)
+    text = re.sub(r'```[\s\S]*?```', '', text)
+
+    # Clean up excessive blank lines (max 2 consecutive)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    # Remove leading/trailing whitespace
+    text = text.strip()
+
+    return text
+
+
 def parse_draft(content: str) -> Optional[Dict[str, str]]:
     """
     Parse a draft markdown file into {to, subject, body, task_id, action,
@@ -594,6 +650,10 @@ class ApprovedEmailSender:
         in_reply_to = draft.get("in_reply_to")
         attachments = draft.get("attachments", [])
 
+        # Clean markdown and meta-commentary from body text
+        # Makes emails/posts look human-written, not AI-generated
+        body = _clean_output_text(body)
+
         # ── Route to correct channel ──────────────────────────────────────────
         if action == "send_whatsapp":
             self._handle_whatsapp_send(file_path, to, body, task_id)
@@ -682,6 +742,9 @@ class ApprovedEmailSender:
         """Send an approved WhatsApp reply via Twilio."""
         from src.watchers.whatsapp_watcher import send_whatsapp_message, ConversationStore
 
+        # Clean markdown and meta-commentary
+        body = _clean_output_text(body)
+
         self.logger.info(f"Sending WhatsApp → to={to}")
 
         if self.dry_run:
@@ -719,6 +782,9 @@ class ApprovedEmailSender:
 
     def _handle_linkedin_post(self, file_path: Path, body: str, task_id: Optional[str]):
         """Post to LinkedIn after human approval."""
+        # Clean markdown and meta-commentary
+        body = _clean_output_text(body)
+
         self.logger.info("Posting to LinkedIn")
 
         if self.dry_run:
@@ -757,6 +823,9 @@ class ApprovedEmailSender:
 
     def _handle_twitter_post(self, file_path: Path, body: str, task_id: Optional[str]):
         """Post to Twitter after human approval."""
+        # Clean markdown and meta-commentary
+        body = _clean_output_text(body)
+
         self.logger.info("Posting to Twitter")
 
         if self.dry_run:
@@ -795,6 +864,9 @@ class ApprovedEmailSender:
 
     def _handle_facebook_post(self, file_path: Path, body: str, task_id: Optional[str]):
         """Post to Facebook after human approval."""
+        # Clean markdown and meta-commentary
+        body = _clean_output_text(body)
+
         self.logger.info("Posting to Facebook")
 
         if self.dry_run:
@@ -848,6 +920,8 @@ class ApprovedEmailSender:
         # Post to LinkedIn
         if linkedin_match:
             linkedin_text = linkedin_match.group(1).strip()
+            # Clean markdown and meta-commentary
+            linkedin_text = _clean_output_text(linkedin_text)
             self.logger.info("Posting to LinkedIn...")
             try:
                 result = subprocess.run(
@@ -869,6 +943,8 @@ class ApprovedEmailSender:
         # Post to Twitter
         if twitter_match:
             twitter_text = twitter_match.group(1).strip()
+            # Clean markdown and meta-commentary
+            twitter_text = _clean_output_text(twitter_text)
             self.logger.info("Posting to Twitter...")
             try:
                 result = subprocess.run(
@@ -890,6 +966,8 @@ class ApprovedEmailSender:
         # Post to Facebook
         if facebook_match:
             facebook_text = facebook_match.group(1).strip()
+            # Clean markdown and meta-commentary
+            facebook_text = _clean_output_text(facebook_text)
             self.logger.info("Posting to Facebook...")
             try:
                 result = subprocess.run(
