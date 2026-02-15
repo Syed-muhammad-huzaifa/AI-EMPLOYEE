@@ -57,7 +57,7 @@ class GmailWatcher(BaseWatcher):
     """
     Extends BaseWatcher to monitor Gmail inbox.
 
-    - Fetches unread important emails every 2 minutes (check_interval=120)
+    - Fetches unread important emails every 5 seconds (check_interval=5)
     - Classifies each email as actionable / non-actionable using three-tier rules:
         1. Sender domain pattern matching
         2. Subject keyword matching
@@ -70,7 +70,7 @@ class GmailWatcher(BaseWatcher):
     - Exponential backoff on errors (1 → 2 → 4 → 8 → … → 60 s)
     """
 
-    def __init__(self, vault_path: Optional[str] = None, check_interval: int = 120):
+    def __init__(self, vault_path: Optional[str] = None, check_interval: int = 5):
         # Load .env before anything else so VAULT_PATH is available
         load_dotenv(_BASE_DIR / ".env")
 
